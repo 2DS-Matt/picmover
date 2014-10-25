@@ -1,0 +1,325 @@
+#!/bin/bash
+#
+# A shell script to help me automate the rync of pictures
+# perhaps replace my personal pic mover script
+#
+# **********************************************************
+# (C)opyright 2013 2DogsStudios.com
+# This script is licensed under GNU GPL Version 2.0 or above
+# **********************************************************
+#
+
+# **********************************************************
+# Revision Notes
+# **********************************************************
+# 201301251630		Added code to insure we are not in the home directory of the user.
+#					Of course, that was the first problem Tracy ran into... :\
+# 201303301137		Moved code into functions
+#                	Added function to look for new version and download
+#                	A lot changed here, so expect instability
+# 201330310832		Added code to backup all images before processing
+#					Added code to restore images to original locations if there is a significant error
+#					Expanded exiftool use to include AVI and MOV files (both upper and lower cases)
+# 201304051818		Removed failed_message() as depricated for error()
+#					Worked backup and restore routines
+# 201310281902		Updated script for NAS storage device UNIVERSUM
+# 201310291745		Update version code to notify if locale version is newer than webversion
+#					Fix / alter mounting code to not stomp on existing !Picture mount 
+# 201402171341		Fix issue with case sensativity in mounting routines
+#					"Mount" vs "mount" 
+# 201403121347		Modification for new Universum Media Pictures file structure 
+# 201407171148		Modification to append oringal name of image to stop dumplicates taken in 
+#					rapid succession.
+# 201409100942		Modification for new mountings using NFS rather than SMB
+
+
+# **********************************************************
+# Future Enhancements
+# **********************************************************
+#
+#
+#
+
+
+##################
+# Variables and Contants 
+##################
+
+mms_pic_dir="/Volumes/media"
+mms_pic_suffix="/pictures/!Pictures/"
+mms_pic_target=$mms_pic_dir$mms_pic_suffix
+temp_dir="temp/"
+program_version="2014091001"
+program_name=`basename $0`			# This appearently returns the name from the shell of the exectute program / script
+install_dir="$HOME/bin/"
+version_file="version.txt"
+prog_name="$program_name Version $program_version"
+mms_pic_url="//universum/Media"
+working_dir=$PWD					# Captures the directory the script was call from
+backup_dir="picmover-bak"
+backup_dir="$HOME/"."$backup_dir"
+backup_flag=0
+
+
+##################
+# Let's introduce ourselves...
+##################
+function intro ()
+{
+	echo 
+	echo $prog_name
+	echo "(c)2013 2DS - Licenced under the GNU"
+	echo "*** STARTED SUCCESSFULLY - "$(date)"."
+	echo
+}
+
+
+##############
+# Check for new version of picmover
+##############
+function update_script ()
+{
+	# wget file from 2dogsstudios.com that houses current version file
+	# compare against $program_version
+	# if = NOTHING
+	# if < download and restart
+	# if > upload current version and version.txt to website
+	
+	cd "$install_dir"
+	
+	rm $version_file			# make sure old version file is gone so there is no conflict
+	curl -o $version_file http://2DogsStudios.com/version.txt >/dev/null 2>&1
+	webversion=`cat $version_file`
+	
+	if [ $program_version -lt $webversion ]
+		then
+			rm $program_name
+			curl -o $program_name http://2DogsStudios.com/picmover >/dev/null 2>&1
+			chown $USER $program_name
+			chmod +x $program_name
+			cd "$working_dir"
+			error "Current Version  : $webversion" "Installed Version: $program_version" " " "*** A newer version of picmover is available online." "    It has been downloaded and installed on this system." "    This version will terminate now.  Invoke picmover to use new version."
+	fi
+
+	if [ $program_version -gt $webversion ]
+		then
+			echo
+			echo "*** Current Version  : $webversion"
+			echo "    Installed Version: $program_version."
+			echo "    Local version is newer than online version.  Transmitting updates..."
+
+			curl -T picmover ftp://www.2dogsstudios.com --user mmshannon:Tr@cy001
+			rm version.txt
+			echo $program_version > version.txt
+			curl -T version.txt ftp://www.2dogsstudios.com --user mmshannon:Tr@cy001
+	fi
+
+	
+	cd "$working_dir"
+}
+
+
+##############
+# We need both exiftool and rsync.  Are they present?
+##############
+function test_tools_exist()
+{
+	if ! [ -e /usr/bin/exiftool ]
+		then
+			error "*** $prog_name requires exiftool to run.  Please download and install" "    exiftool from www.sno.phy.queensu.ca/~phil/exiftool/"
+	fi
+
+	if ! [ -e /usr/bin/rsync ]
+		then
+			error "*** $prog_name requires rsync to run.  Please download and install" "    rsync from rsync.samba.org"
+	fi
+}
+
+
+##############
+# Make sure we are not in the home directory (risk of processing every image)
+##############
+function test_not_homedir ()
+{
+	if [ "$working_dir" == "$HOME" ]
+		then
+			error "*** $prog_name is running in HOME directory.  Images should be stored" "    in a subdirectory to keep from processing all images."
+	fi
+}
+
+
+##############
+# Is the network present and mounted?
+##############
+function test_volume_mounted ()
+{
+	# grep returns a non-zero exit status if there are no matches. 
+	# so we will use this to test for the path of our mount
+	# remember the "!" for not, since its a non-zero
+	# kinda a double negative
+	
+	if ! mount | grep $mms_pic_dir > /dev/null 
+		then														# if its *not* there...
+			echo "*** $mms_pic_dir not mounted.  Attempting to mount volume."
+			mkdir $mms_pic_dir										# create the mount point
+			if ! mount -t smbfs $mms_pic_url $mms_pic_dir		# mount the network drive
+				then
+					error "*** Mount failed.  Terminating."			# and perform error check
+				else
+					echo "*** $mms_pic_dir was successfully mounted."
+			fi
+		else
+			echo "*** $mms_pic_dir previously mounted.  Utilizing exiting mountpoint."
+	fi
+}
+
+
+##############
+# let's make a backup of all the data in the working directory
+# in case we run into a problem.
+##############
+
+function back_it_up ()
+{
+	
+	#echo "$backup_dir"
+	
+	echo "*** Creating backup directory $backup_dir"
+	if ! mkdir $backup_dir 
+		then
+		error "*** Error making the backup directory."
+	fi
+	
+	echo "    Making a backup of the images in case of failure."
+	echo "    Depending on the number of images, this operation could take some time."
+	
+	if ! cp -R * "$backup_dir" 
+		then
+		error "*** Failure making backup of data.  Terminating before further" "    damage can be done."
+	fi
+	
+	echo "*** Backup Complete."
+	backup_flag=1
+	
+}
+
+
+##############
+# Function to restore images copied to $backup_dir if needed
+##############
+
+function restore_backup ()
+{
+	# delete temp directory
+	# delete everything remaining in working directory
+	# copy backup directory to working directory
+	
+	echo "*** Restoring backed up files."
+		
+	cd "$working_dir"
+	echo "    Removing files from $working_dir"
+	rm -r *										# This should delete the remainders and the temp directory.
+	echo "    Restoring files from $backup_dir to $working_dir."
+	cp -R "$backup_dir"/ "$working_dir"			# This should bring everything back to its original location.
+	echo "    Removing $backup_dir."
+	rm -r "$backup_dir"/*
+	rmdir "$backup_dir"
+	
+	#error "*** Backup restored.  Terminating."
+	
+}
+
+
+
+##############
+# exiftool use - rename and orgainize jpg, jpeg, JPG, and JPEG found images
+##############
+function rename_em ()
+{
+	# now rename anything renamable (recursively) in the directory into directories by name, date, and time.
+	# perform exiftool error checking...
+	
+	echo "*** Starting image processing $(date)."
+
+	if ! exiftool -ext jpg -ext jpeg -ext JPG -ext JPEG -ext MOV -ext AVI -ext mov -ext avi -r -d $temp_dir%Y/%Y-%m-%d/%Y-%m-%d-%H.%M.%S%.%%f.%%e "-filename<CreateDate" *
+		then
+			restore_backup
+			error "*** exiftool finished with error.  Terminating." "    Backup restored.  Manual cleanup of files in temp directory may be required."
+		else
+	 		echo "*** exiftool completed SUCCESSFULLY."
+			echo "    Deleting backup as unneeded."
+			rm -R "$backup_dir"
+		fi
+}
+
+
+##############
+# Send renamed images from the temp dir to the default picture location
+##############
+function sync_em ()
+{
+	# Lets sync with the network now.
+	# Store the current working directory
+	curdir=`pwd`
+	# adding a trailing slash for rync compatibility
+	curdir=$curdir/
+	
+	echo "Current Directory  : $curdir"
+	echo "Processed Directory: $curdir$temp_dir"
+	echo "Volume Target      : $mms_pic_target"
+
+	if ! rsync -r -t -v --progress --ignore-existing "$curdir$temp_dir" "$mms_pic_target"
+		then
+			error "*** rsync finished with error.  Terminating." "    All pictures may not have been pushed to server $mms_pic_target."
+	fi
+}
+
+##############
+# End Gracefully
+##############
+function end_gracefully ()
+{
+
+	echo "*** rsync completed SUCCESSFULLY."
+	echo "*** $prog_name completed SUCCESSFULLY - "$(date)"."
+	
+}
+
+
+##############
+# Error Function - receives error code, error message, displays, restores images if necessary, and exits.
+##############
+function error ()
+{
+	index=1
+	errorcode=$1
+
+	for arg in "$@"
+	do
+		echo "$arg"
+		error[$index]=$arg
+		let "index+=1"
+	done
+	
+	echo "*** $prog_name FAILED - "$(date)"."
+	echo
+	exit;
+	
+}
+
+
+
+##############
+# Let's go!
+##############
+
+intro
+update_script
+test_tools_exist
+test_not_homedir
+test_volume_mounted
+back_it_up
+#restore_backup
+rename_em
+sync_em
+end_gracefully
